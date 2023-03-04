@@ -16,6 +16,12 @@ from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
 )
 
+import xformers.ops
+
+XFORMERS_ENABLED = True
+
+print(f'{XFORMERS_ENABLED = }')
+
 
 @dataclass
 class ModelArgs:
@@ -116,7 +122,7 @@ class Attention(nn.Module):
             (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
         ).cuda()
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: xformers.ops.fmha.LowerTriangularMask):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -135,17 +141,25 @@ class Attention(nn.Module):
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
-        xq = xq.transpose(1, 2)
-        keys = keys.transpose(1, 2)
-        values = values.transpose(1, 2)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
-        output = output.transpose(
-            1, 2
-        ).contiguous().view(bsz, seqlen, -1)
+        if XFORMERS_ENABLED:
+            # https://facebookresearch.github.io/xformers/components/ops.html
+            output = xformers.ops.memory_efficient_attention(xq, keys, values, attn_bias=mask,
+                                                             op=xformers.ops.MemoryEfficientAttentionFlashAttentionOp)
+            output = output.contiguous().view(bsz, seqlen, -1)
+        else:
+            xq = xq.transpose(1, 2)
+            keys = keys.transpose(1, 2)
+            values = values.transpose(1, 2)
+
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(
+                self.head_dim)  # query = query * scale; scale = 1 / query.shape[-1] ** 0.5
+            if mask is not None:
+                scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
+            output = output.transpose(
+                1, 2
+            ).contiguous().view(bsz, seqlen, -1)
 
         return self.wo(output)
 
@@ -189,7 +203,7 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: xformers.ops.fmha.LowerTriangularMask):
         h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
@@ -228,8 +242,11 @@ class Transformer(nn.Module):
 
         mask = None
         if seqlen > 1:
-            mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
-            mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+            if XFORMERS_ENABLED:
+                mask = xformers.ops.LowerTriangularMask()
+            else:
+                mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
+                mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
