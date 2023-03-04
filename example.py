@@ -31,11 +31,18 @@ def setup_model_parallel() -> Tuple[int, int]:
     return local_rank, world_size
 
 
-def load(ckpt_dir: str, tokenizer_path: str, local_rank: int, world_size: int) -> LLaMA:
+def load(
+    ckpt_dir: str,
+    tokenizer_path: str,
+    local_rank: int,
+    world_size: int,
+    max_seq_len: int,
+    max_batch_size: int,
+) -> LLaMA:
     start_time = time.time()
     checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
-    assert (
-        world_size == len(checkpoints)
+    assert world_size == len(
+        checkpoints
     ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {world_size}"
     ckpt_path = checkpoints[local_rank]
     print("Loading")
@@ -43,7 +50,9 @@ def load(ckpt_dir: str, tokenizer_path: str, local_rank: int, world_size: int) -
     with open(Path(ckpt_dir) / "params.json", "r") as f:
         params = json.loads(f.read())
 
-    model_args: ModelArgs = ModelArgs(max_seq_len=1024, max_batch_size=1, **params)
+    model_args: ModelArgs = ModelArgs(
+        max_seq_len=max_seq_len, max_batch_size=max_batch_size, **params
+    )
     tokenizer = Tokenizer(model_path=tokenizer_path)
     model_args.vocab_size = tokenizer.n_words
     torch.set_default_tensor_type(torch.cuda.HalfTensor)
@@ -56,18 +65,30 @@ def load(ckpt_dir: str, tokenizer_path: str, local_rank: int, world_size: int) -
     return generator
 
 
-def main(ckpt_dir: str, tokenizer_path: str, temperature: float = 0.8, top_p: float = 0.95, num_batches: int = 10, ipython: bool = True):
+def main(
+    ckpt_dir: str,
+    tokenizer_path: str,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    max_seq_len: int = 1024,
+    max_batch_size: int = 1,
+    num_batches: int = 10,
+    ipython: bool = True,
+    bench: bool = False
+):
     local_rank, world_size = setup_model_parallel()
     if local_rank > 0:
         sys.stdout = open(os.devnull, 'w')
 
-    generator = load(ckpt_dir, tokenizer_path, local_rank, world_size)
-    prompts = ["Here is my sonnet in the style of Shakespeare about an artificial intelligence:"]
-    for i in trange(num_batches):
-        results = generator.generate(prompts, max_gen_len=256, temperature=temperature, top_p=top_p)
+    generator = load(ckpt_dir, tokenizer_path, local_rank, world_size, max_seq_len, max_batch_size)
 
-    for result in results:
-        print(result)
+    if bench:
+        prompts = ["Here is my sonnet in the style of Shakespeare about an artificial intelligence:"]
+        for _ in trange(num_batches):
+            results = generator.generate(prompts, max_gen_len=256, temperature=temperature, top_p=top_p)
+
+        for result in results:
+            print(result)
 
     if ipython:
         IPython.embed()
