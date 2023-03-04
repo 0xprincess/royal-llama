@@ -1,4 +1,29 @@
-# LLaMA 
+# Royal-LLaMA: LLaMA but with jewelry
+
+This is a fork of the LLaMA code that contains various patches that I find useful.
+
+Current features:
+- runs LLaMA-13B within 24 GiB of RAM. (adopted from [https://github.com/tloen/llama-int8])
+- implemented xformers' memory efficient attention
+- runs on Windows (linux should work too)
+
+### From [https://github.com/tloen/llama-int8]'s README:
+The code contains the following changes:
+- Loads all model_dicts into the same GPU
+- Loads existing weights from specified directory
+- Quantizes loaded layers on the host machine after weights are loaded.
+- Added dependencies on `bitsandbytes`, `tqdm`.
+
+It takes over a minute, and up to 50 GB of RAM, to load in the floats and quantize the model, and it's far from optimal re: throughput.
+Someone (maybe me) should publish quantized weights to get around this!
+
+## Usage:
+
+`python example.py --ckpt_dir [TARGET_DIR]/13B --tokenizer_path [TARGET_DIR]/tokenizer.model --max_batch_size=1`
+
+---
+
+# Original README
 
 This repository is intended as a minimal, hackable and readable example to load [LLaMA](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/) ([arXiv](https://arxiv.org/abs/2302.13971v1)) models and run inference.
 In order to download the checkpoints and tokenizer, fill this [google form](https://forms.gle/jk851eBVbX1m5TAv5)
@@ -22,6 +47,7 @@ Edit the `download.sh` script with the signed url provided in the email to downl
 ## Inference
 
 The provided `example.py` can be run on a single or multi-gpu node with `torchrun` and will output completions for two pre-defined prompts. Using `TARGET_FOLDER` as defined in `download.sh`:
+
 ```
 torchrun --nproc_per_node MP example.py --ckpt_dir $TARGET_FOLDER/model_size --tokenizer_path $TARGET_FOLDER/tokenizer.model
 ```

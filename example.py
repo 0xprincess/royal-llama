@@ -36,8 +36,6 @@ def setup_model_parallel() -> Tuple[int, int]:
 def load(
     ckpt_dir: str,
     tokenizer_path: str,
-    local_rank: int,
-    world_size: int,
     max_seq_len: int,
     max_batch_size: int,
 ) -> LLaMA:
