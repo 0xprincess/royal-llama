@@ -3,7 +3,8 @@
 This is a fork of the LLaMA code that contains various patches that I find useful.
 
 Current features:
-- runs LLaMA-13B within 24 GiB of RAM. (adopted from [https://github.com/tloen/llama-int8])
+- ~~runs LLaMA-13B within 24 GiB of RAM. (adopted from [https://github.com/tloen/llama-int8])~~
+- embedded additional samplers and repetition penalty
 - implemented xformers' memory efficient attention
 - runs on Windows (linux should work too)
 - has an option to run IPython interactive console after it load the model. Enable it with `--ipython` cli flag
@@ -51,6 +52,12 @@ The provided `example.py` can be run on a single or multi-gpu node with `torchru
 
 ```
 torchrun --nproc_per_node MP example.py --ckpt_dir $TARGET_FOLDER/model_size --tokenizer_path $TARGET_FOLDER/tokenizer.model
+```
+
+or the following cmd (depends on the environment)
+
+```bash
+python -m torch.distributed.run --nproc_per_node 1 example.py --ckpt_dir $TARGET_FOLDER/model_size --tokenizer_path $TARGET_FOLDER/tokenizer.model
 ```
 
 Different models require different MP values:

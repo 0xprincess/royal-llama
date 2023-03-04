@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the GNU General Public License version 3.
 
+import os
 from typing import Optional, Tuple
 from dataclasses import dataclass
 import math
@@ -8,7 +9,15 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-import bitsandbytes as bnb
+
+import tqdm
+
+INT8_ENABLED = os.name != 'nt'
+
+if INT8_ENABLED:
+    import bitsandbytes as bnb
+else:
+    bnb = None
 
 import fairscale.nn.model_parallel.initialize as fs_init
 from fairscale.nn.model_parallel.layers import (
@@ -16,11 +25,10 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
     ColumnParallelLinear,
 )
-import tqdm
 
 import xformers.ops
 
-XFORMERS_ENABLED = False
+XFORMERS_ENABLED = True
 
 print(f'{XFORMERS_ENABLED = }')
 
@@ -95,25 +103,33 @@ class Attention(nn.Module):
         )  # fs_init.get_model_parallel_world_size()
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = UninitializedLinear(
+        self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
         )
-        self.wk = UninitializedLinear(
+        self.wk = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
         )
-        self.wv = UninitializedLinear(
+        self.wv = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
         )
-        self.wo = UninitializedLinear(
-            args.dim,
+        self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
+            args.dim,
             bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x,
         )
 
         self.cache_k = torch.zeros(
@@ -171,16 +187,14 @@ class FeedForward(nn.Module):
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = UninitializedLinear(dim, hidden_dim, bias=False)
-        self.w2 = UninitializedLinear(
-            hidden_dim,
-            dim,
-            bias=False,
+        self.w1 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
-        self.w3 = UninitializedLinear(
-            dim,
-            hidden_dim,
-            bias=False,
+        self.w2 = RowParallelLinear(
+            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        )
+        self.w3 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
     def forward(self, x):
@@ -239,14 +253,18 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = torch.nn.Embedding(params.vocab_size, params.dim)
+        self.tok_embeddings = ParallelEmbedding(
+            params.vocab_size, params.dim, init_method=lambda x: x
+        )
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = UninitializedLinear(params.dim, params.vocab_size, bias=False)
+        self.output = ColumnParallelLinear(
+            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        )
 
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
@@ -272,6 +290,32 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
+
+    def quantize(self):
+        # https://github.com/pytorch/vision/issues/2391#issuecomment-653900218
+        def get_layer(model, name):
+            layer = model
+            for attr in name.split("."):
+                layer = getattr(layer, attr)
+            return layer
+
+        def set_layer(model, name, layer):
+            try:
+                attrs, name = name.rsplit(".", 1)
+                model = get_layer(model, attrs)
+            except ValueError:
+                pass
+            setattr(model, name, layer)
+
+        linear_layers = {
+            k: v for k, v in self.named_modules() if isinstance(v, nn.Linear)
+        }
+
+        print("Quantizing", len(linear_layers), "layers")
+        for name, layer in tqdm.tqdm(linear_layers.items()):
+            new_layer = Int8Linear(layer)
+            set_layer(self, name, new_layer)
+        self.cuda()
 
     def quantize(self):
         # https://github.com/pytorch/vision/issues/2391#issuecomment-653900218
