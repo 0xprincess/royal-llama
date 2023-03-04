@@ -6,6 +6,7 @@ Current features:
 - runs LLaMA-13B within 24 GiB of RAM. (adopted from [https://github.com/tloen/llama-int8])
 - implemented xformers' memory efficient attention
 - runs on Windows (linux should work too)
+- has an option to run IPython interactive console after it load the model. Enable it with `--ipython` cli flag
 
 ### From [https://github.com/tloen/llama-int8]'s README:
 The code contains the following changes:
