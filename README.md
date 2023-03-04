@@ -9,16 +9,6 @@ Current features:
 - runs on Windows (linux should work too)
 - has an option to run IPython interactive console after it load the model. Enable it with `--ipython` cli flag
 
-### From [https://github.com/tloen/llama-int8]'s README:
-The code contains the following changes:
-- Loads all model_dicts into the same GPU
-- Loads existing weights from specified directory
-- Quantizes loaded layers on the host machine after weights are loaded.
-- Added dependencies on `bitsandbytes`, `tqdm`.
-
-It takes over a minute, and up to 50 GB of RAM, to load in the floats and quantize the model, and it's far from optimal re: throughput.
-Someone (maybe me) should publish quantized weights to get around this!
-
 ## Usage:
 
 `python example.py --ckpt_dir [TARGET_DIR]/13B --tokenizer_path [TARGET_DIR]/tokenizer.model --max_batch_size=1`
