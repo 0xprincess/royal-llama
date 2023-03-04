@@ -157,8 +157,7 @@ class Attention(nn.Module):
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
             output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-
-    return self.wo(output)
+        return self.wo(output)
 
 
 class FeedForward(nn.Module):
