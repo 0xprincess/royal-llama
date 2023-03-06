@@ -14,7 +14,7 @@ from tqdm import trange
 
 
 os.environ["BITSANDBYTES_NOWELCOME"] = "1"
-from llama import ModelArgs, Transformer, Tokenizer, LLaMA, default_quantize
+from llama import ModelArgs, Transformer, Tokenizer, LLaMA, default_quantize, Samplers
 
 
 def load(
@@ -96,7 +96,7 @@ def main(
     tokenizer_path: str,
     temperature: float = 0.8,
     top_p: float = 0.95,
-    max_seq_len: int = 1024,
+    max_seq_len: int = 2048,
     max_batch_size: int = 1,
     num_batches: int = 10,
     ipython: bool = True,
