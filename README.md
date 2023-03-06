@@ -3,21 +3,36 @@
 This is a fork of the LLaMA code that contains various patches that I find useful.
 
 Current features:
-- ~~runs LLaMA-13B within 24 GiB of RAM. (adopted from [https://github.com/tloen/llama-int8])~~
+- runs LLaMA-13B within 24 GiB of RAM. (adopted from [https://github.com/tloen/llama-int8])
 - embedded additional samplers and repetition penalty
-- implemented xformers' memory efficient attention
-- runs on Windows (linux should work too)
+- implemented xformers' memory efficient attention (doesn't give any improvement on Windows on a 4090 machine, feel free to check the implementation and find the flaws)
+- runs on Windows & Linux
 - has an option to run IPython interactive console after it load the model. Enable it with `--ipython` cli flag
 
+To run it on Windows, after installing requirements via pip, copy `bitsandbytes` patch to your env:
+```bash
+cp .\bitsandbytes_windows\*.dll <your_env_dir>\Lib\site-packages\bitsandbytes\
+cp .\bitsandbytes_windows\cextension.py <your_env_dir>\Lib\site-packages\bitsandbytes\cextension.py
+cp .\bitsandbytes_windows\main.py <your_env_dir>\Lib\site-packages\bitsandbytes\cuda_setup\main.py
+```
+
 ### From [https://github.com/tloen/llama-int8]'s README:
+It relies almost entirely on the `bitsandbytes` and `LLM.int8()` work of Tim Dettmers.
+I've tested it on an RTX 4090, and it [reportedly works on the 3090](https://github.com/facebookresearch/llama/issues/79#issuecomment-1454687232). It might also theoretically allow us to run LLaMA-65B on an 80GB A100, but I haven't tried this.
+
 The code contains the following changes:
-- Loads all model_dicts into the same GPU
-- Loads existing weights from specified directory
-- Quantizes loaded layers on the host machine after weights are loaded.
+
+- Removes parallelism constructs
+- Quantizes weights on the host machine
+- Loads weights incrementally to avoid severe memory problems
 - Added dependencies on `bitsandbytes`, `tqdm`.
 
-It takes over a minute, and up to 50 GB of RAM, to load in the floats and quantize the model, and it's far from optimal re: throughput.
-Someone (maybe me) should publish quantized weights to get around this!
+On my Ubuntu machine with 64 GB of RAM and an RTX 4090, it takes about 25 seconds to load in the floats and quantize the model.
+Users should be ready to expand their swapfiles if they don't have enough RAM.
+Llamanon has also produced a [slightly uncouth user's guide](https://rentry.org/llama-tard) for using this repo, which I won't reproduce here but seems generally trustworthy.
+[You may need to build `bitsandbytes` from source.](https://github.com/facebookresearch/llama/issues/79#issuecomment-1454687232)
+
+If you have interesting ideas for further development, I can be reached at https://twitter.com/ecjwg.
 
 ## Usage:
 

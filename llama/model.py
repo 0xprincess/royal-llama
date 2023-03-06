@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the GNU General Public License version 3.
 
-import os
-from typing import Optional, Tuple
+from contextvars import ContextVar
+
+from typing import Optional, Tuple, Type
 from dataclasses import dataclass
 import math
 
@@ -10,28 +11,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-import tqdm
-
-INT8_ENABLED = os.name != 'nt'
-
-if INT8_ENABLED:
-    import bitsandbytes as bnb
-else:
-    bnb = None
-
-import fairscale.nn.model_parallel.initialize as fs_init
-from fairscale.nn.model_parallel.layers import (
-    ParallelEmbedding,
-    RowParallelLinear,
-    ColumnParallelLinear,
-)
-
+import bitsandbytes as bnb
 import xformers.ops
 
-XFORMERS_ENABLED = True
-
-print(f'{XFORMERS_ENABLED = }')
-
+import tqdm
 
 @dataclass
 class ModelArgs:
@@ -44,6 +27,7 @@ class ModelArgs:
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
+    use_xformers: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -94,42 +78,52 @@ class UninitializedLinear(nn.Linear):
         pass
 
 
+class InferenceQuantizedLinear(bnb.nn.Linear8bitLt):
+    def __init__(self, *args, **kwargs):
+        super().__init__(has_fp16_weights=False, *args, **kwargs)
+
+    def reset_parameters(self) -> None:
+        pass
+
+
+default_quantize: ContextVar[bool] = ContextVar("default_quantize", default=False)
+
+def get_linear_class() -> Type[nn.Linear]:
+    if default_quantize.get():
+        return InferenceQuantizedLinear
+    return UninitializedLinear
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
 
+        self.use_xformers = args.use_xformers
         self.n_local_heads = (
             args.n_heads // 1
         )  # fs_init.get_model_parallel_world_size()
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
+        Linear = get_linear_class()
+        self.wq = Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wk = ColumnParallelLinear(
+        self.wk = Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wv = ColumnParallelLinear(
+        self.wv = Linear(
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wo = RowParallelLinear(
-            args.n_heads * self.head_dim,
+        self.wo = Linear(
             args.dim,
+            args.n_heads * self.head_dim,
             bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
         )
 
         self.cache_k = torch.zeros(
@@ -158,7 +152,7 @@ class Attention(nn.Module):
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
 
-        if XFORMERS_ENABLED:
+        if self.use_xformers:
             # https://facebookresearch.github.io/xformers/components/ops.html
             output = xformers.ops.memory_efficient_attention(xq, keys, values, attn_bias=mask,
                                                              op=xformers.ops.MemoryEfficientAttentionFlashAttentionOp)
@@ -187,14 +181,17 @@ class FeedForward(nn.Module):
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        Linear = get_linear_class()
+        self.w1 = Linear(dim, hidden_dim, bias=False)
+        self.w2 = Linear(
+            hidden_dim,
+            dim,
+            bias=False,
         )
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
-        )
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w3 = Linear(
+            dim,
+            hidden_dim,
+            bias=False,
         )
 
     def forward(self, x):
@@ -221,50 +218,40 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Int8Linear(torch.nn.Module):
-    def __init__(
-        self,
-        float_linear: nn.Linear,
-    ) -> None:
-        super().__init__()
-        self.new_layer = bnb.nn.Linear8bitLt(
-            float_linear.in_features,
-            float_linear.out_features,
-            bias=float_linear.bias is not None,
-            has_fp16_weights=False,
-            threshold=6.0,
-        )
-        self.new_layer._parameters["weight"] = bnb.nn.Int8Params(
-            float_linear.weight.data.cpu(),
-            requires_grad=False,
-            has_fp16_weights=False,
-        )
-        if float_linear.bias is not None:
-            self.new_layer._parameters["bias"] = float_linear.bias
-
-    def forward(self, input):
-        return self.new_layer(input)
+def convert_linear_to_bnb(float_linear):
+    new_layer = InferenceQuantizedLinear(
+        float_linear.in_features,
+        float_linear.out_features,
+        bias=float_linear.bias is not None,
+    )
+    new_layer._parameters["weight"] = bnb.nn.Int8Params(
+        float_linear.weight.data.cpu(),
+        requires_grad=False,
+        has_fp16_weights=False,
+    )
+    if float_linear.bias is not None:
+        new_layer._parameters["bias"] = float_linear.bias
+    return new_layer
 
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
         super().__init__()
         self.params = params
+        self.use_xformers = params.use_xformers
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = ParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
-        )
+        self.tok_embeddings = torch.nn.Embedding(params.vocab_size, params.dim)
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
-        )
+
+        Linear = get_linear_class()
+        self.output = Linear(params.dim, params.vocab_size, bias=False)
 
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
@@ -279,7 +266,7 @@ class Transformer(nn.Module):
 
         mask = None
         if seqlen > 1:
-            if XFORMERS_ENABLED:
+            if self.use_xformers:
                 mask = xformers.ops.LowerTriangularMask()
             else:
                 mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
@@ -313,32 +300,6 @@ class Transformer(nn.Module):
 
         print("Quantizing", len(linear_layers), "layers")
         for name, layer in tqdm.tqdm(linear_layers.items()):
-            new_layer = Int8Linear(layer)
-            set_layer(self, name, new_layer)
-        self.cuda()
-
-    def quantize(self):
-        # https://github.com/pytorch/vision/issues/2391#issuecomment-653900218
-        def get_layer(model, name):
-            layer = model
-            for attr in name.split("."):
-                layer = getattr(layer, attr)
-            return layer
-
-        def set_layer(model, name, layer):
-            try:
-                attrs, name = name.rsplit(".", 1)
-                model = get_layer(model, attrs)
-            except ValueError:
-                pass
-            setattr(model, name, layer)
-
-        linear_layers = {
-            k: v for k, v in self.named_modules() if isinstance(v, nn.Linear)
-        }
-
-        print("Quantizing", len(linear_layers), "layers")
-        for name, layer in tqdm.tqdm(linear_layers.items()):
-            new_layer = Int8Linear(layer)
+            new_layer = convert_linear_to_bnb(layer)
             set_layer(self, name, new_layer)
         self.cuda()
